@@ -1,1 +1,349 @@
-{}
+GUÍA DE INTEGRACIÓN — V2Ray VPN (Java) 
+=================================================
+Objetivo: que aparezca la “llave” de Android (VPN activa) y que haya salida a Internet usando tu `V2Service` + `tun2socks` (libv2ray.so).
+Este archivo detalla, **clase por clase**, qué debes poner y en qué métodos.
+
+ÍNDICE
+------
+0) Requisitos previos
+1) AndroidManifest.xml
+2) Activity de arranque (MainActivity) – pedir permiso y lanzar el servicio
+3) V2Tunnel.java – lanzamiento y verificador de Internet
+4) V2Service.java – servicio VPN real (llave + TUN + tun2socks)
+5) TunnelManagerThread.java – no lanzar otro VPN en modo V2Ray
+6) V2Proxy.java – proxy-only (sin llave)
+7) Pruebas y validaciones
+8) Problemas comunes y soluciones rápidas
+
+--------------------------------------------------------------------------
+0) REQUISITOS PREVIOS
+--------------------------------------------------------------------------
+- Mínimo Android 5.0 (API 21). Para setUnderlyingNetworks, Android 9 (API 28).
+- Incluye libv2ray.so en `src/main/jniLibs/ABI/` (armeabi-v7a, arm64-v8a, etc).
+- `V2Config` debe ser **Serializable o Parcelable**. En esta guía usamos **Serializable** en el Intent hacia V2Service.
+- Usa un icono válido (p.ej. `ic_vpn_lock`) para la notificación foreground.
+
+--------------------------------------------------------------------------
+1) ANDROIDMANIFEST.XML
+--------------------------------------------------------------------------
+Asegúrate de declarar el servicio VPN con el permiso correcto:
+
+<service
+    android:name=".V2Service"
+    android:permission="android.permission.BIND_VPN_SERVICE"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="android.net.VpnService" />
+    </intent-filter>
+</service>
+
+*Si targetSdk >= 31, exported debe ser true o false explícitamente (true aquí).
+
+--------------------------------------------------------------------------
+2) ACTIVITY DE ARRANQUE (MainActivity)
+--------------------------------------------------------------------------
+OBJETIVO: Pedir permiso de VPN (consent) y, SOLO si el usuario acepta, lanzar el servicio.
+
+// MainActivity.java (fragmento)
+private static final int REQ_VPN = 1001;
+
+private void pedirPermisoVpnYLanzar() {
+    Intent prepare = VpnService.prepare(this);
+    if (prepare != null) {
+        startActivityForResult(prepare, REQ_VPN);
+    } else {
+        // Ya hay permiso
+        onActivityResult(REQ_VPN, RESULT_OK, null);
+    }
+}
+
+@Override
+protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+    super.onActivityResult(requestCode, resultCode, data);
+    if (requestCode == REQ_VPN && resultCode == RESULT_OK) {
+        // Configura el modo VPN_TUN y lanza usando tu flujo actual
+        V2Tunnel.changeConnectionMode(V2Configs.V2RAY_CONNECTION_MODES.VPN_TUN);
+        V2Tunnel.StartV2ray(
+            getApplicationContext(),
+            "Default",
+            new Settings(this).getPrivString(Settings.V2RAY_JSON),
+            null
+        );
+    }
+}
+
+// Llama a pedirPermisoVpnYLanzar() cuando el usuario pulse “Conectar”.
+// SIN este permiso, builder.establish() devuelve null → NO HAY LLAVE.
+
+--------------------------------------------------------------------------
+3) V2TUNNEL.JAVA
+--------------------------------------------------------------------------
+ARCHIVO: crisdev.http.sshservice.tunnel.V2Tunnel
+
+3.1 StartV2ray(...) — Alinear lanzamiento del servicio
+- Para PROXY_ONLY: lanzar V2Proxy (como ya lo haces)
+- Para VPN_TUN: lanzar V2Service con ACTION + EXTRA correctos
+- En Android O+ utiliza startForegroundService
+
+// Cambios clave dentro de StartV2ray(...)
+Intent start_intent;
+if (V2Configs.V2RAY_CONNECTION_MODE == V2Configs.V2RAY_CONNECTION_MODES.PROXY_ONLY) {
+    start_intent = new Intent(context, V2Proxy.class);
+    start_intent.putExtra("COMMAND", V2Configs.V2RAY_SERVICE_COMMANDS.START_SERVICE);
+    start_intent.putExtra("V2_CONFIG", V2Configs.V2RAY_CONFIG);
+} else if (V2Configs.V2RAY_CONNECTION_MODE == V2Configs.V2RAY_CONNECTION_MODES.VPN_TUN) {
+    start_intent = new Intent(context, V2Service.class);
+    start_intent.setAction("START_V2RAY_VPN");
+    start_intent.putExtra("V2RAY_CONFIG", V2Configs.V2RAY_CONFIG);
+} else {
+    v2Listener.onError();
+    SkStatus.logInfo("V2Ray Error");
+    return;
+}
+
+if (V2Configs.V2RAY_CONNECTION_MODE == V2Configs.V2RAY_CONNECTION_MODES.VPN_TUN) {
+    androidx.core.content.ContextCompat.startForegroundService(context, start_intent);
+} else {
+    context.startService(start_intent);
+}
+
+SkStatus.logInfo(V2Tunnel.getCoreVersion());
+v2Listener.startService();
+SkStatus.logInfo("Iniciando V2ray");
+SkStatus.logInfo("Verificando conexión a internet");
+siNoInternet();
+
+3.2 Verificador de Internet — evitar falsos negativos
+Usa HTTP 204, con 3 reintentos, como ya tienes implementado:
+
+public static boolean verificarInternet() {
+    HttpURLConnection conn = null;
+    try {
+        URL url = new URL("https://connectivitycheck.gstatic.com/generate_204");
+        conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(3000);
+        conn.setReadTimeout(3000);
+        conn.setInstanceFollowRedirects(false);
+        conn.setUseCaches(false);
+        conn.setRequestMethod("GET");
+        int code = conn.getResponseCode();
+        return code == 204 || code == 200;
+    } catch (Exception e) { return false; }
+    finally { if (conn != null) conn.disconnect(); }
+}
+
+3.3 StopV2ray(...)
+Para VPN_TUN envía action "STOP_V2RAY_VPN".
+
+--------------------------------------------------------------------------
+4) V2SERVICE.JAVA (EL SERVICIO VPN REAL)
+--------------------------------------------------------------------------
+ARCHIVO: crisdev.http.sshservice.V2Service
+
+4.1 Foreground + Notificación obligatoria (Android 8+)
+— Añade el método ensureForeground() y llámalo al inicio de onStartCommand().
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import androidx.core.app.NotificationCompat;
+
+private static final String VPN_CH_ID = "vpn";
+private static final int VPN_NOTIF_ID = 1001;
+
+private void ensureForeground() {
+    if (android.os.Build.VERSION.SDK_INT >= 26) {
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        NotificationChannel ch = new NotificationChannel(VPN_CH_ID, "VPN", NotificationManager.IMPORTANCE_LOW);
+        nm.createNotificationChannel(ch);
+    }
+    Notification notif = new NotificationCompat.Builder(this, VPN_CH_ID)
+            .setContentTitle("DoriaxVPN")
+            .setContentText("Conectando…")
+            .setSmallIcon(R.drawable.ic_vpn_lock)
+            .setOngoing(true)
+            .build();
+    startForeground(VPN_NOTIF_ID, notif);
+}
+
+@Override
+public int onStartCommand(Intent intent, int flags, int startId) {
+    ensureForeground(); // <<<< LLAMAR AQUÍ
+    // ... resto del switch(action)
+    return START_STICKY;
+}
+
+4.2 onStartCommand(...) — leer V2Config como Serializable (si tu clase no es Parcelable)
+case "START_V2RAY_VPN":
+    v2Config = (V2Config) intent.getSerializableExtra("V2RAY_CONFIG");
+    if (v2Config != null) {
+        startV2RayVpn();
+    } else {
+        Log.e(TAG, "Configuración V2Ray nula");
+        stopSelf();
+    }
+    break;
+
+4.3 setupVpnInterface() — construir el TUN que muestra la llave
+- Debe devolver true y `mInterface` NO puede ser null.
+- Agrega setSession para que Android muestre el nombre.
+
+private boolean setupVpnInterface() {
+    try {
+        Builder builder = new Builder();
+        builder.setSession("DoriaxVPN");     // nombre visible
+        builder.addAddress(vpnClientIp, 30); // 26.26.26.1/30
+        builder.addRoute("0.0.0.0", 0);
+        builder.addDnsServer("8.8.8.8");
+        builder.addDnsServer("8.8.4.4");
+        builder.setMtu(vpnMtu);
+        configurePerAppProxy(builder);
+
+        mInterface = builder.establish();
+        if (mInterface == null) { Log.e(TAG, "No se pudo establecer el TUN"); return false; }
+
+        setupUnderlyingNetwork(); // API 28+
+        return true;
+    } catch (Exception e) {
+        Log.e(TAG, "Error configurando interfaz VPN", e);
+        return false;
+    }
+}
+
+4.4 setUnderlyingNetworks (API 28+)
+— Ya lo tienes en onCreate(): NetworkRequest y NetworkCallback para prevenir “VPN sobre sí misma”. Mantener.
+
+4.5 tun2socks (libv2ray.so) — parámetros y envío del FD
+- Empareja /30: cliente en Builder (26.26.26.1) y router en tun2socks (26.26.26.2).
+- Trabaja en `getFilesDir()` porque ahí vive el `--sock-path`.
+- Envía el FD del TUN por LocalSocket con reintentos.
+
+private static final int SOCKS_PORT = 10808;
+
+private void startTun2Socks() {
+    String libPath = new File(getApplicationInfo().nativeLibraryDir, "libv2ray.so").getAbsolutePath();
+    ArrayList<String> cmd = new ArrayList<>();
+    cmd.add(libPath);
+    cmd.add("--netif-ipaddr");   cmd.add(vpnRouterIp);           // 26.26.26.2
+    cmd.add("--netif-netmask");  cmd.add("255.255.255.252");
+    cmd.add("--socks-server-addr"); cmd.add("127.0.0.1:" + SOCKS_PORT);
+    cmd.add("--tunmtu");         cmd.add(String.valueOf(vpnMtu));
+    cmd.add("--sock-path");      cmd.add("sock_path");
+    cmd.add("--enable-udprelay");
+    cmd.add("--loglevel");       cmd.add("notice");
+    ProcessBuilder pb = new ProcessBuilder(cmd);
+    pb.redirectErrorStream(true);
+    pb.directory(getFilesDir()); // IMPORTANTE
+    tun2socksProcess = pb.start();
+
+    new Thread(() -> { try { tun2socksProcess.waitFor(); } catch (Exception ignored) {} if (isRunning) restartTun2Socks(); }).start();
+    sendFd(); // <<<< sin esto NO habrá tráfico
+}
+
+private void sendFd() {
+    final File sock = new File(getFilesDir(), "sock_path");
+    final String path = sock.getAbsolutePath();
+    executor.submit(() -> {
+        int tries = 0;
+        while (tries <= 6 && isRunning) {
+            LocalSocket ls = null;
+            try {
+                if (tries > 0) Thread.sleep(50L << tries); // backoff
+                ls = new LocalSocket();
+                ls.connect(new LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM));
+                ls.setFileDescriptorsForSend(new FileDescriptor[]{ mInterface.getFileDescriptor() });
+                ls.getOutputStream().write(42);
+                ls.getOutputStream().flush();
+                Log.i(TAG, "✓ FD del TUN enviado a tun2socks");
+                break;
+            } catch (Exception ex) {
+                Log.e(TAG, "Fallo enviando FD (intento " + tries + ")", ex);
+                tries++;
+            } finally { try { if (ls != null) ls.close(); } catch (Exception ignored) {} }
+        }
+    });
+}
+
+4.6 stopV2RayVpn()
+Orden recomendado: parar tun2socks → core → stopSelf → cerrar TUN (lo tienes correcto).
+
+--------------------------------------------------------------------------
+5) TUNNELMANAGERTHREAD.JAVA
+--------------------------------------------------------------------------
+OBJETIVO: En modo V2Ray NO iniciar tu otro VpnService (TunnelVpnService). Evitar doble VPN.
+
+A) En el v2Listener.onConnected():
+@Override
+public void onConnected() {
+    SkStatus.updateStateString(SkStatus.SSH_CONECTADO, "V2Ray Conectado");
+    SkStatus.logInfo("<font color='GREEN'><strong>V2Ray conectado exitosamente</strong></font>");
+    if (isv2raymode()) return; // <<<< NO iniciar TunnelVpnService en V2Ray
+    if (!mConnected) { mConnected = true; startTunnelVpnService(); }
+}
+
+B) Blindar el método startTunnelVpnService():
+protected void startTunnelVpnService() throws IOException {
+    if (isv2raymode()) {
+        SkStatus.logInfo("VPN: V2Ray maneja su propio TUN; no se inicia TunnelVpnService");
+        return;
+    }
+    // ... resto de tu lógica existente
+}
+
+C) onProtect(int socket)
+En V2Ray el protect real lo hace V2Service. Esta implementación puede devolver true en V2Ray:
+@Override
+public boolean onProtect(int socket) {
+    try {
+        if (!isv2raymode()) {
+            TunnelVpnManager mgr = TunnelState.getTunnelState().getTunnelManager();
+            if (mgr != null && mgr.getVpnService() != null) return mgr.getVpnService().protect(socket);
+        }
+        return true; // V2Ray maneja el protect en su propio servicio
+    } catch (Exception e) { return true; }
+}
+
+--------------------------------------------------------------------------
+6) V2PROXY.JAVA (proxy-only)
+--------------------------------------------------------------------------
+- No muestra llave (no es VpnService).
+- Sin cambios obligatorios; asegúrate de que “COMMAND” y “V2_CONFIG” coinciden con este servicio.
+
+--------------------------------------------------------------------------
+7) PRUEBAS Y VALIDACIONES
+--------------------------------------------------------------------------
+1) Flujo de conexión
+   - Tocar “Conectar” → se llama a pedirPermisoVpnYLanzar().
+   - Aceptas permiso del sistema → se lanza V2Tunnel.StartV2ray(...).
+
+2) Logcat que debes ver
+   - "V2Service iniciando..."
+   - "✓ Interfaz VPN configurada exitosamente" (aparece la LLAVE)
+   - "Iniciando tun2socks..."
+   - "✓ FD del TUN enviado a tun2socks"
+   - En 1–3 s, tu verificador debería registrar “Conectado”.
+
+3) Ajustes del dispositivo
+   - Ajustes → VPN: verás “DoriaxVPN (conectado)”. En algunos OEM (MIUI/ColorOS) habilita mostrar icono de VPN en barra de estado.
+
+4) dumpsys (si usas ADB)
+   - `adb shell dumpsys vpn` → tu paquete debe figurar como VPN activa.
+
+--------------------------------------------------------------------------
+8) PROBLEMAS COMUNES
+--------------------------------------------------------------------------
+- No aparece la llave:
+  * No pediste permiso (prepare()) → establish() devuelve null.
+  * Manifest sin `android.permission.BIND_VPN_SERVICE` o `exported` incorrecto.
+  * Arrancaste el servicio en background (Android 8+) sin foreground: usa startForegroundService + startForeground().
+
+- Hay llave pero sin Internet:
+  * No se envió el FD del TUN (sendFd falló) → revisa logs de “Fallo enviando FD”.
+  * Par /30 incoherente: Builder usa 26.26.26.1/30 y tun2socks debe usar 26.26.26.2.
+  * DNS rotos (prueba 8.8.8.8/8.8.4.4 o 1.1.1.1).
+  * setUnderlyingNetworks no aplicado en Android 9+ → tráfico atrapado.
+
+- Conecta/desconecta en bucle:
+  * Estás iniciando **otro** VpnService (TunnelVpnService) en modo V2Ray. Aplica la guarda de la sección 5.
+
+Fin.
